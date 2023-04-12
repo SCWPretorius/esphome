@@ -53,7 +53,7 @@ enum class WintexInitState : uint8_t {
 };
 
 std::vector<uint8_t> read_payload(uint32_t address, uint8_t length);
-std::vector<uint8_t> write_payload(uint32_t address, std::vector<uint8_t> data);
+std::vector<uint8_t> write_payload(uint32_t address, std::vector<uint8_t> payload);
 
 struct WintexResponse {
   WintexResponseType answer;
@@ -64,13 +64,12 @@ struct WintexResponse {
 };
 
 // struct WintexCommand {
-//   WintexCommandType cmd;
-//   std::vector<uint8_t> data;
-//   WintexCommand(WintexCommandType cmd, std::vector<uint8_t> &data) : cmd{cmd}, data{data.begin(), data.end()} {}
-//   WintexCommand(WintexCommandType cmd) : cmd{cmd}, data{} {}
-//   WintexCommand() : cmd{WintexCommandType::NONE} {}
-//   ~WintexCommand() { ESP_LOGV("WintexCommand", "WintexCommand Destructor called for %c : %s", cmd,
-//   format_hex_pretty(data).c_str()); }
+//   WintexCommandType command;
+//   std::vector<uint8_t> payload;
+//   WintexCommand(WintexCommandType command, std::vector<uint8_t> &payload) : command{command},
+//   payload{payload.begin(), payload.end()} {} WintexCommand(WintexCommandType command) : command{command}, payload{}
+//   {} WintexCommand() : command{WintexCommandType::NONE} {} ~WintexCommand() { ESP_LOGV("WintexCommand",
+//   "WintexCommand Destructor called for %c : %s", command, format_hex_pretty(payload).c_str()); }
 // };
 
 struct AsyncWintexCommand;
@@ -78,21 +77,19 @@ struct AsyncWintexCommand;
 using ResponseCallback = std::function<optional<AsyncWintexCommand>(WintexResponse)>;
 
 struct AsyncWintexCommand {
-  WintexCommandType cmd;
-  std::vector<uint8_t> data;
-  uint32_t delay{0};
+  WintexCommandType command;
+  const std::vector<uint8_t> payload;
   ResponseCallback callback;
-  AsyncWintexCommand(WintexCommandType cmd, std::vector<uint8_t> &data, uint32_t delay, ResponseCallback callback)
-      : cmd{cmd}, data{data}, delay{delay}, callback{callback} {};
-  AsyncWintexCommand(WintexCommandType cmd, std::vector<uint8_t> &data, ResponseCallback callback)
-      : cmd{cmd}, data{data}, callback{callback} {};
-  AsyncWintexCommand(WintexCommandType cmd, ResponseCallback callback) : cmd{cmd}, data{}, callback{callback} {};
-  AsyncWintexCommand() : cmd{WintexCommandType::NONE}, data{} {
+  AsyncWintexCommand(WintexCommandType command, const std::vector<uint8_t> &payload, ResponseCallback callback)
+      : command{command}, payload{payload}, callback{callback} {};
+  AsyncWintexCommand(WintexCommandType command, ResponseCallback callback)
+      : command{command}, payload{}, callback{callback} {};
+  AsyncWintexCommand() : command{WintexCommandType::NONE}, payload{} {
     ESP_LOGE("AsyncWintexCommand", "AsyncWintexCommand Null Constructor called");
   }
   ~AsyncWintexCommand() {
-    ESP_LOGE("AsyncWintexCommand", "AsyncWintexCommand Destructor called for %c : %s", static_cast<uint8_t>(cmd),
-             format_hex_pretty(data).c_str());
+    ESP_LOGE("AsyncWintexCommand", "AsyncWintexCommand Destructor called for %c : %s", static_cast<uint8_t>(command),
+             format_hex_pretty(payload).c_str());
   }
 };
 
@@ -141,11 +138,25 @@ class WintexButton : public button::Button {
   friend class Wintex;
 
  public:
-  WintexButton(Wintex *wintex, WintexCommandType cmd, std::vector<uint8_t> payload, bool commit_required)
-      : wintex_{wintex}, commit_required_{commit_required} {
-    auto tmp = std::vector<uint8_t>{payload.begin(), payload.end()};
-    command_ = AsyncWintexCommand(cmd, tmp, this->command_callback_);
-  }
+  WintexButton(Wintex *wintex, WintexCommandType command, std::vector<uint8_t> payload, bool commit_required)
+      : wintex_{wintex},
+        command_{[&]() {
+          std::vector<uint8_t> payload_vector{payload.begin(), payload.end()};
+          return AsyncWintexCommand(command, payload_vector,
+                                    [this](WintexResponse response) { return command_callback(response); });
+        }()},
+        commit_required_{commit_required} {}
+  WintexButton(const WintexButton &button)
+      : wintex_{button.wintex_},
+        command_{button.command_.command, button.command_.payload,
+                 [this](WintexResponse response) { return command_callback(response); }},
+        commit_required_{button.commit_required_} {}
+  WintexButton(WintexButton &&button)
+      : wintex_{button.wintex_},
+        command_{button.command_.command, button.command_.payload,
+                 [this](WintexResponse response) { return command_callback(response); }},
+        commit_required_{button.commit_required_} {}
+  virtual ~WintexButton() = default;
 
  protected:
   void press_action();
@@ -161,16 +172,17 @@ class WintexButton : public button::Button {
     }
     return {};
   };
-  AsyncWintexCommand commit_ = AsyncWintexCommand(WintexCommandType::COMMIT, this->commit_callback_);
-  ResponseCallback command_callback_ = [this](WintexResponse response) -> optional<AsyncWintexCommand> {
+  optional<AsyncWintexCommand> command_callback(WintexResponse response) {
+    AsyncWintexCommand commit = AsyncWintexCommand(WintexCommandType::COMMIT, this->commit_callback_);
     if (response.answer != WintexResponseType::ACK) {
       ESP_LOGE(TAG, "Unexpected response to command: %d", (uint8_t) response.answer);
     } else {
       if (commit_required_) {
-        ESP_LOGE("wintex_button", "Sending COMMIT");
-        return commit_;
+        ESP_LOGE("wintex_button", "COMMIT required, heap free = %d", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        return commit;
       }
     }
+    ESP_LOGE("wintex_button", "No COMMIT required");
     return {};
   };
 };
@@ -268,7 +280,10 @@ class Wintex : public Component, public uart::UARTDevice {
   void setup() override;
   void loop() override;
   void dump_config() override;
-  void set_udl(std::string udl) { this->login_.data = std::vector<uint8_t>{udl.begin(), udl.end()}; }
+  void set_udl(std::string udl) {
+    this->login_ = AsyncWintexCommand(WintexCommandType::SESSION, std::vector<uint8_t>{udl.begin(), udl.end()},
+                                      [this](WintexResponse response) { return this->handle_login_(response); });
+  }
   void register_zone(WintexZone *zone);
   void register_partition(WintexPartition *partition);
 

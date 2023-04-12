@@ -263,6 +263,7 @@ void Wintex::loop() {
       read_byte(&c);
       rx_message_.push_back(c);
     }
+    ESP_LOGD(TAG, "Calling process_response_ with %d bytes", rx_message_.size());
     process_response_();
   }
 
@@ -276,7 +277,8 @@ void Wintex::loop() {
       // this->mark_failed();
     }
   }
-  if (init_state_ == WintexInitState::AUTH && (millis() - last_command_timestamp_ > 2000)) {
+  if (init_state_ == WintexInitState::AUTH &&
+      (command_queue_.size() == 0 && millis() - last_command_timestamp_ > 2000)) {
     update_sensors_();
   }
   process_command_queue_();
@@ -325,25 +327,30 @@ optional<WintexResponse> Wintex::parse_response_() {
 }
 
 void Wintex::process_response_() {
+  ESP_LOGV(TAG, "process_response");
   optional<WintexResponse> response = this->parse_response_();
   if (response.has_value() && this->current_command_.has_value()) {
+    ESP_LOGD(TAG, "Invoking callback");
     ResponseCallback callback = this->current_command_.value().callback;
+    ESP_LOGD(TAG, "Invoked callback, getting next_command");
     optional<AsyncWintexCommand> next_command = callback(response.value());
+    ESP_LOGD(TAG, "Got next_command");
     if (next_command.has_value()) {
-      ESP_LOGE(TAG, "Command '%x' got response '%x' from panel, next command is '%x'",
-               static_cast<uint8_t>(current_command_.value().cmd), static_cast<uint8_t>(response.value().answer),
-               static_cast<uint8_t>(next_command.value().cmd));
+      ESP_LOGD(TAG, "Command '%x' got response '%x' from panel, next command is '%x'",
+               static_cast<uint8_t>(current_command_.value().command), static_cast<uint8_t>(response.value().answer),
+               static_cast<uint8_t>(next_command.value().command));
       this->current_command_ = {};
-      this->send_command_now_(next_command.value());
+      this->queue_command_(next_command.value());
     } else {
-      ESP_LOGE(TAG, "Command '%x' got response '%x' from panel, no next command",
-               static_cast<uint8_t>(current_command_.value().cmd), static_cast<uint8_t>(response.value().answer));
+      ESP_LOGD(TAG, "Command '%x' got response '%x' from panel, no next command",
+               static_cast<uint8_t>(current_command_.value().command), static_cast<uint8_t>(response.value().answer));
       this->current_command_ = {};
     }
   }
 }
 
 void Wintex::update_sensors_() {
+  ESP_LOGD(TAG, "Updating sensors");
   // this->current_sensor_ = 0;
   if (sensors_.size() == 0)
     return;
@@ -379,19 +386,19 @@ optional<AsyncWintexCommand> Wintex::handle_sensors_(WintexResponse response) {
 void Wintex::send_command_now_(AsyncWintexCommand command) {
   this->current_command_ = command;
 
-  ESP_LOGV(TAG, "Sending Wintex: CMD=0x%02X DATA=[%s]", static_cast<uint8_t>(command.cmd),
-           format_hex_pretty(command.data).c_str());
+  ESP_LOGV(TAG, "Sending Wintex: COMMAND=0x%02X PAYLOAD=[%s]", static_cast<uint8_t>(command.command),
+           format_hex_pretty(command.payload).c_str());
 
-  uint8_t len = (uint8_t) (command.data.size()) + 3;
+  uint8_t len = (uint8_t)(command.payload.size()) + 3;
 
-  uint8_t checksum = len + (uint8_t) (command.cmd);
-  for (auto &data : command.data)
-    checksum += data;
+  uint8_t checksum = len + (uint8_t)(command.command);
+  for (auto &payload : command.payload)
+    checksum += payload;
   checksum ^= 0xFF;
 
-  write_array({len, (uint8_t) command.cmd});
-  if (!command.data.empty())
-    write_array(command.data.data(), command.data.size());
+  write_array({len, (uint8_t) command.command});
+  if (!command.payload.empty())
+    write_array(command.payload.data(), command.payload.size());
   write_byte(checksum);
   flush();
 }
@@ -427,7 +434,7 @@ void Wintex::setup_zones_() {
 }
 
 void Wintex::queue_command_(AsyncWintexCommand command) {
-  // ESP_LOGD(TAG, "Queue size: %d", command_queue_.size());
+  ESP_LOGD(TAG, "Queue size: %d", command_queue_.size());
   command_queue_.push_back(command);
   process_command_queue_();
 }
