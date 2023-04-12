@@ -78,10 +78,12 @@ using ResponseCallback = std::function<optional<AsyncWintexCommand>(WintexRespon
 
 struct AsyncWintexCommand {
   WintexCommandType command;
-  const std::vector<uint8_t> payload;
+  std::vector<uint8_t> payload;
   ResponseCallback callback;
   AsyncWintexCommand(WintexCommandType command_, std::vector<uint8_t> &&payload_, ResponseCallback callback_)
       : command{command_}, payload{std::move(payload_)}, callback{callback_} {};
+  AsyncWintexCommand(WintexCommandType command_, const std::vector<uint8_t> &payload_, ResponseCallback callback_)
+      : command{command_}, payload{payload_}, callback{callback_} {};
   AsyncWintexCommand(WintexCommandType command_, ResponseCallback callback_)
       : command{command_}, payload{}, callback{callback_} {};
   AsyncWintexCommand() : command{WintexCommandType::NONE}, payload{} {
@@ -140,11 +142,9 @@ class WintexButton : public button::Button {
  public:
   WintexButton(Wintex *wintex, WintexCommandType command, std::vector<uint8_t> payload, bool commit_required)
       : wintex_{wintex},
-        command_{[&]() {
-          std::vector<uint8_t> payload_vector{payload.begin(), payload.end()};
-          return AsyncWintexCommand(command, payload_vector,
-                                    [this](WintexResponse response) { return command_callback(response); });
-        }()},
+        command_{command,
+                 {payload.begin(), payload.end()},
+                 [this](WintexResponse response) { return command_callback(response); }},
         commit_required_{commit_required} {}
   WintexButton(const WintexButton &button)
       : wintex_{button.wintex_},
