@@ -80,10 +80,10 @@ struct AsyncWintexCommand {
   WintexCommandType command;
   const std::vector<uint8_t> payload;
   ResponseCallback callback;
-  AsyncWintexCommand(WintexCommandType command, const std::vector<uint8_t> &payload, ResponseCallback callback)
-      : command{command}, payload{payload}, callback{callback} {};
-  AsyncWintexCommand(WintexCommandType command, ResponseCallback callback)
-      : command{command}, payload{}, callback{callback} {};
+  AsyncWintexCommand(WintexCommandType command_, std::vector<uint8_t> &&payload_, ResponseCallback callback_)
+      : command{command_}, payload{std::move(payload_)}, callback{callback_} {};
+  AsyncWintexCommand(WintexCommandType command_, ResponseCallback callback_)
+      : command{command_}, payload{}, callback{callback_} {};
   AsyncWintexCommand() : command{WintexCommandType::NONE}, payload{} {
     ESP_LOGE("AsyncWintexCommand", "AsyncWintexCommand Null Constructor called");
   }
