@@ -82,10 +82,6 @@ void WintexPartition::setup(Wintex *wintex, uint32_t partition_base_address, uin
   armed->set_name(name + " armed");
   wintex->register_sensor(armed);
   App.register_binary_sensor(armed);
-  stay_armed = new WintexBinarySensor(partition_base_address, partition_group_size, 0x08, partition << 4);
-  stay_armed->set_name(name + " stay armed");
-  wintex->register_sensor(stay_armed);
-  App.register_binary_sensor(stay_armed);
   ready = new WintexBinarySensor(partition_base_address, partition_group_size, 0x09, partition);
   ready->set_name(name + " ready");
   ready->set_disabled_by_default(true);
@@ -109,10 +105,6 @@ void WintexPartition::setup(Wintex *wintex, uint32_t partition_base_address, uin
   confirmed_alarm->set_name(name + " confirmed alarm");
   wintex->register_sensor(confirmed_alarm);
   App.register_binary_sensor(confirmed_alarm);
-  away_armed = new WintexBinarySensor(partition_base_address, partition_group_size, 0x10, partition);
-  away_armed->set_name(name + " away armed");
-  wintex->register_sensor(away_armed);
-  App.register_binary_sensor(away_armed);
   armed_alarm = new WintexBinarySensor(partition_base_address, partition_group_size, 0x11, partition << 4);
   armed_alarm->set_name(name + " armed/alarm");
   armed_alarm->set_disabled_by_default(true);
@@ -128,15 +120,21 @@ void WintexPartition::setup(Wintex *wintex, uint32_t partition_base_address, uin
   wintex->register_sensor(all_armed);
   App.register_binary_sensor(all_armed);
 
-  arm = new WintexPartitionArmSwitch(wintex, partition_base_address, partition_group_size, 0x08,
-                                     partition | partition << 4);
-  arm->set_name(name + " arm");
-  arm->add_on_state_callback([this](bool state) { this->publish_state(state); });
-  wintex->register_sensor(arm);
-  App.register_switch(arm);
+  away_arm = new WintexPartitionArmSwitch(wintex, partition_base_address, partition_group_size, 0x10, partition);
+  away_arm->set_name(name + " away arm");
+  wintex->register_sensor(away_arm);
+  App.register_switch(away_arm);
+  stay_arm = new WintexPartitionStayArmSwitch(wintex, partition_base_address, partition_group_size, 0x08, partition);
+  stay_arm->set_name(name + " stay arm");
+  wintex->register_sensor(stay_arm);
+  App.register_switch(stay_arm);
+
   reset = new WintexPartitionResetButton(wintex, partition);
   reset->set_name(name + " reset");
   App.register_button(reset);
+
+  away_arm->add_on_state_callback([this](bool state) { this->publish_state(away_arm->state || stay_arm->state); });
+  stay_arm->add_on_state_callback([this](bool state) { this->publish_state(away_arm->state || stay_arm->state); });
 }
 
 void WintexZone::setup(Wintex *wintex, uint32_t zone_base_address, uint16_t zone_group_size, std::string zone_name) {
@@ -187,6 +185,8 @@ void WintexZone::setup(Wintex *wintex, uint32_t zone_base_address, uint16_t zone
 
 void Wintex::setup() {
   last_command_timestamp_ = millis();
+  // system_voltage = new WintexVoltageSensor();
+
   setup_partitions_();
   setup_zones_();
   /*
@@ -198,6 +198,19 @@ void Wintex::setup() {
   std::vector<std::string> zones = get_zone_names(0, 0x20);
   setup_zones(0, 0x20, addresses[n], zones)
   */
+  test_button_ = new WintexButton(this, this->query_addresses_);
+  test_button_->set_name("Test");
+  App.register_button(test_button_);
+  system_voltage = new WintexVoltageSensor(0x0DB7 + 0x10, 4, 0);
+  system_voltage->set_name("System Voltage");
+  register_sensor(system_voltage);
+  App.register_sensor(system_voltage);
+  battery_voltage = new WintexVoltageSensor(0x0DB7 + 0x10, 4, 2);
+  battery_voltage->set_name("Battery Voltage");
+  register_sensor(battery_voltage);
+  App.register_sensor(battery_voltage);
+  // make sure sensors are properly sorted by address, to reduce traffic
+  std::sort(sensors_.begin(), sensors_.end());
 }
 
 /*
@@ -220,6 +233,10 @@ optional<WintexResponse> Wintex::send_command_blocking_(WintexCommand command) {
   return response;
 }
 */
+optional<AsyncWintexCommand> Wintex::handle_addresses_(WintexResponse response) {
+  ESP_LOGD(TAG, "Addresses are %s", format_hex_pretty(response.data).c_str());
+  return {};
+}
 
 optional<AsyncWintexCommand> Wintex::handle_login_(WintexResponse response) {
   if (response.answer == WintexResponseType::SESSION) {
@@ -263,7 +280,7 @@ void Wintex::loop() {
       read_byte(&c);
       rx_message_.push_back(c);
     }
-    ESP_LOGD(TAG, "Calling process_response_ with %d bytes", rx_message_.size());
+    // ESP_LOGD(TAG, "Calling process_response_ with %d bytes", rx_message_.size());
     process_response_();
   }
 
@@ -314,7 +331,7 @@ optional<WintexResponse> Wintex::parse_response_() {
   if (rx_checksum != calc_checksum) {
     ESP_LOGW(TAG, "Wintex Received invalid message checksum DATA=[%s] Checksum: %02X!=%02X",
              format_hex_pretty(&rx_message_[0], length).c_str(), rx_checksum, calc_checksum);
-    this->rx_message_.clear();
+    rx_message_.clear();
     return {};
   }
 
@@ -327,30 +344,21 @@ optional<WintexResponse> Wintex::parse_response_() {
 }
 
 void Wintex::process_response_() {
-  ESP_LOGV(TAG, "process_response");
   optional<WintexResponse> response = this->parse_response_();
   if (response.has_value() && this->current_command_.has_value()) {
-    ESP_LOGD(TAG, "Invoking callback");
     ResponseCallback callback = this->current_command_.value().callback;
-    ESP_LOGD(TAG, "Invoked callback, getting next_command");
     optional<AsyncWintexCommand> next_command = callback(response.value());
-    ESP_LOGD(TAG, "Got next_command");
     if (next_command.has_value()) {
-      ESP_LOGD(TAG, "Command '%x' got response '%x' from panel, next command is '%x'",
-               static_cast<uint8_t>(current_command_.value().command), static_cast<uint8_t>(response.value().answer),
-               static_cast<uint8_t>(next_command.value().command));
       this->current_command_ = {};
-      this->queue_command_(next_command.value());
+      this->send_command_now_(next_command.value());
     } else {
-      ESP_LOGD(TAG, "Command '%x' got response '%x' from panel, no next command",
-               static_cast<uint8_t>(current_command_.value().command), static_cast<uint8_t>(response.value().answer));
       this->current_command_ = {};
     }
   }
 }
 
 void Wintex::update_sensors_() {
-  ESP_LOGD(TAG, "Updating sensors");
+  // ESP_LOGD(TAG, "Updating sensors");
   // this->current_sensor_ = 0;
   if (sensors_.size() == 0)
     return;
@@ -371,8 +379,8 @@ optional<AsyncWintexCommand> Wintex::handle_sensors_(WintexResponse response) {
   }
   while (current_sensor_ < sensors_.size()) {
     auto sensor = sensors_[current_sensor_];
-    if (address == sensor->get_address() && length == sensor->get_length()) {
-      sensor->update_state(data);
+    if (address == sensor->get_address() && length >= sensor->get_length()) {
+      sensor->update_state(data, length);
       current_sensor_++;
     } else {
       ESP_LOGV(TAG, "Changing requested address at sensor %d", current_sensor_);
@@ -386,7 +394,7 @@ optional<AsyncWintexCommand> Wintex::handle_sensors_(WintexResponse response) {
 void Wintex::send_command_now_(AsyncWintexCommand command) {
   this->current_command_ = command;
 
-  ESP_LOGV(TAG, "Sending Wintex: COMMAND=0x%02X PAYLOAD=[%s]", static_cast<uint8_t>(command.command),
+  ESP_LOGD(TAG, "Sending Wintex: COMMAND=%c PAYLOAD=[%s]", static_cast<uint8_t>(command.command),
            format_hex_pretty(command.payload).c_str());
 
   uint8_t len = (uint8_t)(command.payload.size()) + 3;
@@ -434,7 +442,8 @@ void Wintex::setup_zones_() {
 }
 
 void Wintex::queue_command_(AsyncWintexCommand command) {
-  ESP_LOGD(TAG, "Queue size: %d", command_queue_.size());
+  if (command_queue_.size() > 1)
+    ESP_LOGD(TAG, "Queue size: %d", command_queue_.size());
   command_queue_.push_back(command);
   process_command_queue_();
 }

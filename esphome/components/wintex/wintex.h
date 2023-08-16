@@ -87,11 +87,11 @@ struct AsyncWintexCommand {
   AsyncWintexCommand(WintexCommandType command_, ResponseCallback callback_)
       : command{command_}, payload{}, callback{callback_} {};
   AsyncWintexCommand() : command{WintexCommandType::NONE}, payload{} {
-    ESP_LOGE("AsyncWintexCommand", "AsyncWintexCommand Null Constructor called");
+    // ESP_LOGE("AsyncWintexCommand", "AsyncWintexCommand Null Constructor called");
   }
   ~AsyncWintexCommand() {
-    ESP_LOGE("AsyncWintexCommand", "AsyncWintexCommand Destructor called for %c : %s", static_cast<uint8_t>(command),
-             format_hex_pretty(payload).c_str());
+    // ESP_LOGE("AsyncWintexCommand", "AsyncWintexCommand Destructor called for %c : %s", static_cast<uint8_t>(command),
+    //          format_hex_pretty(payload).c_str());
   }
 };
 
@@ -108,9 +108,22 @@ class WintexSensorBase {
   }
   uint32_t get_address() { return this->address_; }
   uint8_t get_length() { return this->length_; }
+  bool operator<(const WintexSensorBase &other) const {
+    if (address_ < other.address_)
+      return true;
+    if (address_ > other.address_)
+      return false;
+    if (length_ > other.length_)
+      return true;
+    if (length_ < other.length_)
+      return false;
+    if (offset_ < other.offset_)
+      return true;
+    return false;
+  }
 
  protected:
-  virtual void update_state(const uint8_t *memory) = 0;
+  virtual void update_state(const uint8_t *memory, uint8_t length) = 0;
   uint32_t address_{0};
   uint8_t length_{0};
   uint8_t offset_{0};
@@ -124,16 +137,24 @@ class WintexBinarySensor : public WintexSensorBase, public binary_sensor::Binary
   }
 
  protected:
-  void update_state(const uint8_t *memory) override { this->publish_state(memory[offset_] & mask_); };
+  void update_state(const uint8_t *memory, uint8_t length) override { this->publish_state(memory[offset_] & mask_); };
   uint8_t mask_;
 };
 
 class WintexVoltageSensor : public WintexSensorBase, public sensor::Sensor {
  public:
-  WintexVoltageSensor(uint32_t address, uint8_t length, uint8_t offset) : WintexSensorBase(address, length, offset) {}
+  WintexVoltageSensor(uint32_t address, uint8_t length, uint8_t offset) : WintexSensorBase(address, length, offset) {
+    set_unit_of_measurement("V");
+    set_accuracy_decimals(2);
+    set_device_class("voltage");
+    set_state_class(sensor::StateClass::STATE_CLASS_MEASUREMENT);
+  }
 
  protected:
-  void update_state(const uint8_t *memory) { this->publish_state(memory[offset_] / 255 * 17.93); };
+  void update_state(const uint8_t *memory, uint8_t length) {
+    ESP_LOGD("WintexVoltage", "memory is %s", format_hex_pretty(memory, length).c_str());
+    this->publish_state(static_cast<float>(memory[offset_]) * 17.93 / 255);
+  };
 };
 
 class WintexButton : public button::Button {
@@ -146,6 +167,8 @@ class WintexButton : public button::Button {
                  {payload.begin(), payload.end()},
                  [this](WintexResponse response) { return command_callback(response); }},
         commit_required_{commit_required} {}
+  WintexButton(Wintex *wintex, AsyncWintexCommand command)
+      : wintex_{wintex}, command_{command}, commit_required_{false} {}
   WintexButton(const WintexButton &button)
       : wintex_{button.wintex_},
         command_{button.command_.command, button.command_.payload,
@@ -174,15 +197,13 @@ class WintexButton : public button::Button {
   };
   optional<AsyncWintexCommand> command_callback(WintexResponse response) {
     AsyncWintexCommand commit = AsyncWintexCommand(WintexCommandType::COMMIT, this->commit_callback_);
-    if (response.answer != WintexResponseType::ACK) {
-      ESP_LOGE(TAG, "Unexpected response to command: %d", (uint8_t) response.answer);
-    } else {
+    if (response.answer == WintexResponseType::ACK) {
       if (commit_required_) {
-        ESP_LOGE("wintex_button", "COMMIT required, heap free = %d", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         return commit;
       }
+    } else {
+      ESP_LOGE(TAG, "Unexpected response to command: %d", (uint8_t) response.answer);
     }
-    ESP_LOGE("wintex_button", "No COMMIT required");
     return {};
   };
 };
@@ -199,7 +220,7 @@ class WintexSwitch : public WintexSensorBase, public switch_::Switch {
   };
 
  protected:
-  void update_state(const uint8_t *memory) override { this->publish_state(memory[offset_] & mask_); };
+  void update_state(const uint8_t *memory, uint8_t length) override { this->publish_state(memory[offset_] & mask_); };
   uint8_t mask_;
   WintexButton on_, off_;
 };
@@ -221,6 +242,14 @@ class WintexPartitionArmSwitch : public WintexSwitch {
                      WintexButton(wintex, WintexCommandType::DISARM, {partition_mask}, false)) {}
 };
 
+class WintexPartitionStayArmSwitch : public WintexSwitch {
+ public:
+  WintexPartitionStayArmSwitch(Wintex *wintex, uint32_t address, uint8_t length, uint8_t offset, uint8_t partition_mask)
+      : WintexSwitch(address, length, offset, partition_mask << 4,
+                     WintexButton(wintex, WintexCommandType::PART_ARM, {partition_mask, 0}, false),
+                     WintexButton(wintex, WintexCommandType::DISARM, {partition_mask}, false)) {}
+};
+
 class WintexPartitionResetButton : public WintexButton {
  public:
   WintexPartitionResetButton(Wintex *wintex, uint8_t partition_mask)
@@ -230,7 +259,7 @@ class WintexPartitionResetButton : public WintexButton {
 /**
  * @brief WintexZone represents an entire zone, with a number of binary_sensors
  * We expose the zone's status directly as a binary_sensor using a callback
- * that mirrors the zone_status sensor to the zone itself.
+ * that mirrors the status sensor to the zone itself.
  *
  */
 class WintexZone : public binary_sensor::BinarySensor {
@@ -241,7 +270,7 @@ class WintexZone : public binary_sensor::BinarySensor {
   // called after the hub has queried the various base addresses,
   // as well as the zone names, from the panel
   // Can be overridden by YAML configuration.
-  WintexBinarySensor *status, *tamper, *test, *alarmed, *auto_bypassed;
+  WintexBinarySensor *status, *tamper, *test, *alarmed, *auto_bypassed, *faulty;
   WintexSwitch *bypass;
 
  protected:
@@ -257,9 +286,9 @@ class WintexPartition : public binary_sensor::BinarySensor {
 
  public:
   WintexPartition(uint8_t partition) { partition_ = partition; }
-  WintexBinarySensor *panic, *burglar, *bell, *strobe, *entry, *exit, *armed, *stay_armed, *ready, *bypass,
-      *reset_required, *ack_required, *confirmed_alarm, *away_armed, *armed_alarm, *arm_failed, *all_armed;
-  WintexSwitch *arm;
+  WintexBinarySensor *panic, *burglar, *bell, *strobe, *entry, *exit, *armed, *ready, *bypass, *reset_required,
+      *ack_required, *confirmed_alarm, *armed_alarm, *arm_failed, *all_armed;
+  WintexSwitch *away_arm, *stay_arm;
   WintexButton *reset;
 
  protected:
@@ -286,6 +315,7 @@ class Wintex : public Component, public uart::UARTDevice {
   }
   void register_zone(WintexZone *zone);
   void register_partition(WintexPartition *partition);
+  WintexVoltageSensor *system_voltage, *battery_voltage;
 
  protected:
   void queue_command_(AsyncWintexCommand command);
@@ -300,6 +330,7 @@ class Wintex : public Component, public uart::UARTDevice {
   void setup_partitions_();
   void update_sensors_();
 
+  optional<AsyncWintexCommand> handle_addresses_(WintexResponse response);
   optional<AsyncWintexCommand> handle_login_(WintexResponse response);
   optional<AsyncWintexCommand> handle_heartbeat_(WintexResponse response);
   optional<AsyncWintexCommand> handle_sensors_(WintexResponse response);
@@ -309,6 +340,9 @@ class Wintex : public Component, public uart::UARTDevice {
   WintexInitState init_state_ = WintexInitState::UNAUTH;
   uint32_t last_command_timestamp_{0};
   std::string product_ = "";
+  AsyncWintexCommand query_addresses_ =
+      AsyncWintexCommand(WintexCommandType::READ_CONFIGURATION, read_payload(0x1fe6, 0x18),
+                         [this](WintexResponse response) { return this->handle_addresses_(response); });
   AsyncWintexCommand login_ = AsyncWintexCommand(
       WintexCommandType::SESSION, NO_DATA, [this](WintexResponse response) { return this->handle_login_(response); });
   AsyncWintexCommand heartbeat_ =
@@ -322,7 +356,7 @@ class Wintex : public Component, public uart::UARTDevice {
   uint16_t current_sensor_{0};
   optional<AsyncWintexCommand> current_command_{};
   optional<WintexResponse> sensor_response_;
-  // WintexButton *test_button_;
+  WintexButton *test_button_;
   // std::vector<uint8_t> fake_response_ = {
   //   0x0b, 0x5a, 0x05, 0x01, 0x00, 0x07, 0x09, 0x04, 0x07, 0x01, 0x78,
   //   0x13, 0x5a, 0x50, 0x72, 0x65, 0x6d, 0x69, 0x65, 0x72, 0x20, 0x38, 0x33, 0x32, 0x20, 0x56, 0x34, 0x2e, 0x30, 0xf9,
