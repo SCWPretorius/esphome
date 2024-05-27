@@ -214,9 +214,9 @@ class WintexSwitch : public WintexSensorBase, public switch_::Switch {
       : WintexSensorBase(address, length, offset), mask_{mask}, on_{on}, off_{off} {}
   void write_state(bool state);
   void set_name(const std::string &name) {
-    Switch::set_name(name);
-    on_.set_name(name + " ON");
-    off_.set_name(name + " OFF");
+      Switch::set_name(name.c_str());
+      on_.set_name((name + " ON").c_str());
+      off_.set_name((name + " OFF").c_str());
   };
 
  protected:
